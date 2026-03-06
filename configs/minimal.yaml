@@ -1,0 +1,24 @@
+# gomm2 — Minimal configuration
+# Quick start: replicate all topics between two clusters.
+
+clusters:
+  source:
+    bootstrap_servers:
+      - "localhost:9092"
+  target:
+    bootstrap_servers:
+      - "localhost:9093"
+
+replications:
+  - source: source
+    target: target
+    enabled: true
+    # All defaults apply:
+    # - Replicate all topics (no filter)
+    # - DefaultPolicy with "." separator
+    # - Heartbeats, checkpoints, offset syncs all enabled
+    # - LZ4 compression, batch size 16KB
+
+metrics:
+  enabled: true
+  address: ":9090"

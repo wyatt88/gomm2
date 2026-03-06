@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gomm2-config
+  namespace: kafka
+data:
+  config.yaml: |
+    clusters:
+      source:
+        bootstrap_servers:
+          - "kafka-source:9092"
+      target:
+        bootstrap_servers:
+          - "kafka-target:9092"
+    replications:
+      - source: source
+        target: target
+        enabled: true
+        compression: "zstd"
+        producer_batch_size: 65536
+        producer_linger_ms: 10
+    metrics:
+      enabled: true
+      address: ":9090"
+    logging:
+      level: "info"
+      format: "json"

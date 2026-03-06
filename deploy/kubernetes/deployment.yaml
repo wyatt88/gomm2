@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gomm2
+  namespace: kafka
+  labels:
+    app: gomm2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gomm2
+  template:
+    metadata:
+      labels:
+        app: gomm2
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: gomm2
+          image: gomm2:latest
+          args:
+            - "--config"
+            - "/etc/gomm2/config.yaml"
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gomm2
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: gomm2-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gomm2-metrics
+  namespace: kafka
+  labels:
+    app: gomm2
+spec:
+  selector:
+    app: gomm2
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics

@@ -1,0 +1,96 @@
+# gomm2 — Full example configuration
+# See DESIGN.md for architecture details.
+
+clusters:
+  primary:
+    bootstrap_servers:
+      - "kafka-primary-1:9092"
+      - "kafka-primary-2:9092"
+      - "kafka-primary-3:9092"
+    sasl:
+      mechanism: "SCRAM-SHA-512"
+      username: "${KAFKA_PRIMARY_USER}"
+      password: "${KAFKA_PRIMARY_PASS}"
+    tls:
+      enabled: true
+      ca_cert_file: "/etc/gomm2/certs/primary-ca.pem"
+
+  backup:
+    bootstrap_servers:
+      - "kafka-backup-1:9092"
+      - "kafka-backup-2:9092"
+      - "kafka-backup-3:9092"
+    sasl:
+      mechanism: "SCRAM-SHA-512"
+      username: "${KAFKA_BACKUP_USER}"
+      password: "${KAFKA_BACKUP_PASS}"
+    tls:
+      enabled: true
+      ca_cert_file: "/etc/gomm2/certs/backup-ca.pem"
+
+replications:
+  # primary → backup (active-passive DR)
+  - source: primary
+    target: backup
+    enabled: true
+
+    topic_filter:
+      whitelist:
+        - "^orders.*"
+        - "^payments.*"
+        - "^events\\..*"
+      blacklist:
+        - ".*\\.test$"
+        - ".*\\.staging$"
+
+    group_filter:
+      whitelist:
+        - ".*"
+      blacklist:
+        - "^__.*"  # skip internal groups
+
+    config_filter:
+      blacklist:
+        - "follower.replication.throttled.replicas"
+        - "leader.replication.throttled.replicas"
+
+    replication_policy: "default"
+    separator: "."
+    replication_factor: 3
+    sync_topic_configs: true
+    sync_topic_acls: false
+    emit_heartbeats: true
+    emit_checkpoints: true
+    emit_offset_syncs: true
+
+    # Intervals
+    refresh_topics_interval: "30s"
+    refresh_groups_interval: "30s"
+    sync_topic_configs_interval: "60s"
+    sync_topic_acls_interval: "60s"
+    heartbeat_interval: "1s"
+    checkpoint_interval: "60s"
+
+    # Performance tuning
+    producer_batch_size: 65536        # 64KB
+    producer_linger_ms: 10
+    consumer_poll_timeout: "1s"
+    max_poll_records: 1000
+    compression: "zstd"
+    read_committed: true
+
+  # Optional: backup → primary (bidirectional)
+  # - source: backup
+  #   target: primary
+  #   enabled: false
+  #   topic_filter:
+  #     whitelist: ["^orders.*"]
+  #   replication_policy: "default"
+
+metrics:
+  enabled: true
+  address: ":9090"
+
+logging:
+  level: "info"          # debug | info | warn | error
+  format: "json"         # json | console
