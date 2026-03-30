@@ -123,15 +123,76 @@ To exceed 564 MB/s, you'd need larger source brokers (kafka.m5.xlarge = 375 MB/s
 
 ## Memory Budget
 
+### Original Estimate (v2, workers_per_partition=6)
+
 | Component | Per-unit | Count | Total |
 |-----------|----------|-------|-------|
 | Fetcher franz-go clients | ~10MB (5MB fetch + overhead) | 48 | ~480MB |
 | Ring buffers (pointers only) | ~128KB | 8 | ~1MB |
 | Shared producer buffers | ~256MB | 1 | ~256MB |
 | Go runtime + other | ~200MB | 1 | ~200MB |
-| **Total** | | | **~937MB** |
+| **Total (estimated)** | | | **~937MB** |
 
-Well within the 8GB budget. Can safely run alongside normal source mode.
+### ⚠️ Actual Measurement (300GB / 80M records test, 2026-03-30)
+
+| Phase | RSS | Notes |
+|-------|-----|-------|
+| Catch-up start (+15s) | 6.4GB | 48 workers spinning up |
+| Catch-up peak (+18min) | **6.9GB** | All 48 workers + producer active |
+| 5/8 partitions done (+42min) | 6.2GB | Drained partitions releasing buffers |
+| 7/8 partitions done (+52min) | 5.0GB | Near completion |
+| Tail (+54min) | 4.9GB | Only 1 partition still running |
+
+**Estimate was off by 7.4×.** Root cause analysis:
+
+| Component | Estimated | Actual (inferred) | Why |
+|-----------|-----------|-------------------|-----|
+| franz-go fetch buffers per worker | ~10MB | ~50-100MB | franz-go allocates internal response buffers, decompression buffers, and record slices beyond FetchMaxPartitionBytes |
+| 48 workers × actual buffer | 480MB | **2.4-4.8GB** | This is the dominant memory consumer |
+| Ring buffer record pointers | ~1MB | ~488MB | Slots hold `*kgo.Record` but the pointed-to data resides in fetch buffers; overlap with above |
+| MaxBufferedRecords=500K | (not counted) | up to **1.87GB** | 500K × 3.75KB per record if target has backpressure |
+| Go runtime (GC metadata, goroutine stacks) | ~200MB | ~300-500MB | 48+ goroutines, large heap, GOMAXPROCS=2 limited GC parallelism |
+| **Total** | **937MB** | **6.9GB** | |
+
+### Revised Memory Model (v2.1)
+
+The key insight: **each franz-go consumer allocates significantly more than just `FetchMaxPartitionBytes`**.
+Internal buffers include: fetch response buffer, decompression buffer, record slice header pool,
+and topic/partition metadata. Empirically, each consumer uses ~100-140MB at peak.
+
+**Formula:**
+
+```
+Memory ≈ (workers_per_partition × partitions × franz_go_per_consumer)
+        + producer_buffers
+        + go_runtime_overhead
+
+Where:
+  franz_go_per_consumer ≈ 100-140MB (empirical, depends on record size and fetch rate)
+  producer_buffers ≈ 256-512MB (MaxBufferedRecords × avg_record_size)
+  go_runtime_overhead ≈ 300-500MB (GC metadata, stacks, internal structures)
+```
+
+### Recommended Configurations
+
+| Scenario | workers_per_partition | Partitions | Total Workers | Est. Memory | K8s Limit |
+|----------|----------------------|------------|---------------|-------------|-----------|
+| **Small** (≤50GB, ≤4 partitions) | 2 | 4 | 8 | ~2GB | 4Gi |
+| **Medium** (50-300GB, 8 partitions) | 4 | 8 | 32 | ~4-5GB | 8Gi |
+| **Large** (>300GB, 16+ partitions) | 3 | 16 | 48 | ~6-7GB | 10Gi |
+| **XL** (>1TB, 32+ partitions) | 2 | 32 | 64 | ~8-10GB | 16Gi |
+
+> **Rule of thumb:** `workers_per_partition × partitions × 140MB + 1GB overhead`.
+> Set K8s memory limit to 1.2× this value. Set GOMEMLIMIT to 75% of K8s limit.
+
+### New Default: workers_per_partition=4 (was 6)
+
+Reducing from 6 to 4 workers per partition:
+- **Memory savings:** 32 workers instead of 48 → ~2GB less fetch buffer memory
+- **Throughput impact:** Minimal. With 4 workers × 8 partitions = 32 connections,
+  still ~10-11 per broker. At 15 MB/s per connection = ~480 MB/s aggregate,
+  still saturates kafka.m5.large × 3 (564 MB/s limit).
+- **Configurable:** `workers_per_partition` is now in YAML config, not hardcoded.
 
 ## Data Integrity Guarantees
 
@@ -166,25 +227,32 @@ checkpoint emitter will eventually produce checkpoints once the sync store has e
 
 ## Configuration Recommendations
 
-### For `perf-test-8p` (8 partitions, 2M × 40KB, 3 brokers)
+### For `perf-test-8p` (8 partitions, ~3.75KB avg records, 3 brokers)
 
 ```yaml
-# In engine.go constants (recompile to change):
-workersPerPartition: 6    # 6 × 8 = 48 total connections
-parallelThreshold: 100000 # only parallelize if lag > 100K records
+# In config.yaml under the replication entry:
+workers_per_partition: 4       # 4 × 8 = 32 total connections (was 6/48)
+fetch_max_partition_bytes: 5242880  # 5MB per worker fetch
+ring_buffer_capacity: 16384    # slots per partition ring buffer
 ```
 
-### Tuning Knobs (via code constants)
+### Environment variables (set in K8s deployment or runtime)
 
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| `workersPerPartition` | 6 | 48 total connections, ~16 per broker, saturates broker throughput |
-| `FetchMaxPartitionBytes` | 5MB | Balance between fetch efficiency and memory. Increase to 10MB if memory allows |
-| `ringCap` | 16384 | ~512 fetches worth of buffer. Increase if drainer is slower than fetchers |
-| `DrainBatch` | 512 | Records per drain iteration. Larger = better batching, smaller = lower latency |
-| `ProducerBatchMaxBytes` | 1MB | Standard Kafka batch size |
-| `ProducerLinger` | 5ms | Low linger since target is same-VPC |
-| `MaxBufferedRecords` | 500K | Large buffer for producer backpressure |
+```bash
+GOMAXPROCS=4       # match CPU limit, enables GC parallelism
+GOMEMLIMIT=6GiB    # 75% of 8Gi K8s limit, prevents OOM while allowing Go GC to work efficiently
+```
+
+### Tuning Knobs (now configurable via YAML)
+
+| Parameter | Default | Range | Rationale |
+|-----------|---------|-------|-----------|
+| `workers_per_partition` | 4 | 2-8 | More workers = higher throughput but more memory. ~140MB per worker. |
+| `fetch_max_partition_bytes` | 5MB | 1-10MB | Larger = fewer fetches but more memory per worker |
+| `ring_buffer_capacity` | 16384 | 4096-65536 | Larger = more burst absorption, more memory |
+| `ProducerBatchMaxBytes` | 1MB | — | Standard Kafka batch size (hardcoded) |
+| `ProducerLinger` | 5ms | — | Low linger since target is same-VPC (hardcoded) |
+| `MaxBufferedRecords` | 500K | — | Large buffer for producer backpressure (hardcoded) |
 
 ### For Larger Deployments
 

@@ -109,6 +109,11 @@ type ReplicationConfig struct {
 	Compression          string        `yaml:"compression"` // none, gzip, snappy, lz4, zstd
 	ReadCommitted        bool          `yaml:"read_committed"`
 
+	// Parallel catch-up tuning
+	WorkersPerPartition    int    `yaml:"workers_per_partition"`      // fetcher workers per partition during catch-up (default 4)
+	FetchMaxPartitionBytes int    `yaml:"fetch_max_partition_bytes"`  // per-worker FetchMaxPartitionBytes in bytes (default 5MB)
+	RingBufferCapacity     int    `yaml:"ring_buffer_capacity"`      // ring buffer slots per partition (default 16384)
+
 	// Reliability & exactly-once semantics
 	ExactlyOnce          bool     `yaml:"exactly_once"`
 	OffsetCommitInterval Duration `yaml:"offset_commit_interval"`
@@ -118,6 +123,12 @@ type ReplicationConfig struct {
 	RetryBackoffMax      Duration `yaml:"retry_backoff_max"`
 	DLQEnabled           bool     `yaml:"dlq_enabled"`
 	ShutdownTimeout      Duration `yaml:"shutdown_timeout"`
+
+	// FIX(nexus): Bug 3 — OffsetSyncInterval controls how often offset syncs
+	// are persisted to the internal topic (every N records). Java MM2 uses
+	// offset.lag.max=100 by default; gomm2 was hardcoded to 2000 (20x worse
+	// precision). Now configurable, default 100 to match Java MM2 behavior.
+	OffsetSyncInterval   int      `yaml:"offset_sync_interval"`
 }
 
 // TopicFilterConfig defines topic filtering rules.
@@ -311,6 +322,17 @@ func setDefaults(cfg *Config) {
 			r.SyncTopicConfigs = &t
 		}
 
+		// Parallel catch-up defaults
+		if r.WorkersPerPartition == 0 {
+			r.WorkersPerPartition = 4
+		}
+		if r.FetchMaxPartitionBytes == 0 {
+			r.FetchMaxPartitionBytes = 5 * 1024 * 1024 // 5MB
+		}
+		if r.RingBufferCapacity == 0 {
+			r.RingBufferCapacity = 16384
+		}
+
 		// Reliability defaults
 		if r.OffsetCommitInterval.Duration == 0 {
 			r.OffsetCommitInterval.Duration = 5 * time.Second
@@ -329,6 +351,12 @@ func setDefaults(cfg *Config) {
 		}
 		if r.ShutdownTimeout.Duration == 0 {
 			r.ShutdownTimeout.Duration = 30 * time.Second
+		}
+		// FIX(nexus): Bug 3 — Default offset sync interval to 100, matching
+		// Java MM2's offset.lag.max default. Was previously hardcoded to 2000
+		// in source.go, meaning offset translation precision was 20x worse.
+		if r.OffsetSyncInterval == 0 {
+			r.OffsetSyncInterval = 100
 		}
 	}
 	if cfg.Metrics.Address == "" {

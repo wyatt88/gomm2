@@ -26,6 +26,23 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         fsGroup: 10001
+      # Spread pods across nodes to avoid co-locating with other memory-heavy workloads
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: gomm2
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: gomm2
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: gomm2
           image: gomm2:latest
@@ -41,13 +58,18 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+          env:
+            - name: GOMAXPROCS
+              value: "4"
+            - name: GOMEMLIMIT
+              value: "6GiB"
           livenessProbe:
             httpGet:
               path: /healthz
               port: metrics
             initialDelaySeconds: 15
             periodSeconds: 30
-            failureThreshold: 3
+            failureThreshold: 5
             timeoutSeconds: 5
           readinessProbe:
             httpGet:
@@ -59,11 +81,11 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: "1"
-              memory: 512Mi
+              cpu: "2"
+              memory: 4Gi
             limits:
               cpu: "4"
-              memory: 2Gi
+              memory: 8Gi
           volumeMounts:
             - name: config
               mountPath: /etc/gomm2

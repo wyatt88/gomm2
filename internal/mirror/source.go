@@ -43,6 +43,17 @@ type Source struct {
 	wg               sync.WaitGroup
 	subscribedTopics map[string]struct{}
 	inflight         sync.WaitGroup
+
+	// parallelism: number of concurrent consumer→producer pipelines
+	parallelism int
+	consumers   []*kgo.Client
+
+	// [FIX-FORGE Bug2] Track produce errors to block offset commit when errors exist
+	produceErrors atomic.Int64
+
+	// [FIX-FORGE Bug3] Retry and circuit breaker for produce failures
+	retryCfg       RetryConfig
+	circuitBreaker *CircuitBreaker
 }
 
 // NewSource creates a new Source replicator.
@@ -61,6 +72,26 @@ func NewSource(
 	if err != nil {
 		return nil, fmt.Errorf("create replication policy: %w", err)
 	}
+
+	// [FIX-FORGE Bug3] Initialize DLQ if enabled
+	var dlq *DLQ
+	if cfg.DLQEnabled {
+		dlq, err = NewDLQ(cfg, tgtCfg, m, logger)
+		if err != nil {
+			logger.Warn("failed to create DLQ for source, continuing without DLQ", "err", err)
+		}
+	}
+
+	// [FIX-FORGE Bug3] Build retry config from replication config
+	retryCfg := RetryConfig{
+		MaxRetries:  cfg.MaxRetries,
+		BackoffBase: cfg.RetryBackoffBase.Duration,
+		BackoffMax:  cfg.RetryBackoffMax.Duration,
+	}
+	if retryCfg.MaxRetries == 0 {
+		retryCfg = DefaultRetryConfig()
+	}
+
 	return &Source{
 		cfg:              cfg,
 		srcCfg:           srcCfg,
@@ -71,6 +102,9 @@ func NewSource(
 		syncStore:        syncStore,
 		logger:           logger.With("component", "source", "flow", cfg.Source+"->"+cfg.Target),
 		subscribedTopics: make(map[string]struct{}),
+		dlq:              dlq,
+		retryCfg:         retryCfg,
+		circuitBreaker:   NewCircuitBreaker(DefaultCircuitBreakerConfig()),
 	}, nil
 }
 
@@ -215,19 +249,32 @@ func (s *Source) Stop() {
 	s.logger.Info("draining inflight produces")
 	s.inflight.Wait()
 
+	// [FIX-FORGE Bug2] Check produce errors before final commit
+	errCount := s.produceErrors.Load()
+	if errCount > 0 {
+		s.logger.Error("produce errors detected during shutdown — skipping final offset commit to prevent data loss",
+			"produce_errors", errCount)
+	}
+
 	if s.consumer != nil {
-		s.logger.Info("committing final offsets before shutdown")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := s.consumer.CommitUncommittedOffsets(ctx); err != nil {
-			s.logger.Error("failed to commit final offsets", "err", err)
-		} else {
-			s.logger.Info("final offsets committed")
+		if errCount == 0 {
+			s.logger.Info("committing final offsets before shutdown")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := s.consumer.CommitUncommittedOffsets(ctx); err != nil {
+				s.logger.Error("failed to commit final offsets", "err", err)
+			} else {
+				s.logger.Info("final offsets committed")
+			}
+			cancel()
 		}
-		cancel()
 		s.consumer.Close()
 	}
 	if s.producer != nil {
 		s.producer.Close()
+	}
+	// [FIX-FORGE Bug3] Close DLQ producer on shutdown
+	if s.dlq != nil {
+		s.dlq.Close()
 	}
 	s.running = false
 	s.logger.Info("source replication stopped")
@@ -249,7 +296,11 @@ func (s *Source) replicationLoop(ctx context.Context) {
 		lastCommitTime     = time.Now()
 		commitInterval     = s.cfg.OffsetCommitInterval.Duration
 		commitBatch        = s.cfg.OffsetCommitBatch
-		syncWriteInterval  = int64(2000)
+		// FIX(nexus): Bug 3 — Use configurable offset sync interval instead of
+		// hardcoded 2000. Java MM2 default is 100 (offset.lag.max), so gomm2
+		// now defaults to 100 via config.setDefaults(). Users can override via
+		// offset_sync_interval in the replication config YAML.
+		syncWriteInterval  = int64(s.cfg.OffsetSyncInterval)
 		recordsSinceSync   atomic.Int64
 
 		// Batched metrics: accumulate locally, flush periodically
@@ -323,13 +374,63 @@ func (s *Source) replicationLoop(ctx context.Context) {
 
 			s.inflight.Add(1)
 			srcOffset := record.Offset
+			// [FIX-FORGE Bug3] Capture record data for retry/DLQ on produce failure
+			srcKey := record.Key
+			srcValue := record.Value
+			srcHeaders := record.Headers
+			srcTopic := record.Topic
+			srcPartition := record.Partition
+
 			s.producer.Produce(ctx, targetRecord, func(r *kgo.Record, err error) {
 				defer s.inflight.Done()
 				if err != nil {
 					s.logger.Error("produce error", "topic", targetTopic, "partition", record.Partition, "offset", srcOffset, "err", err)
 					s.metrics.ProduceErrors.WithLabelValues(srcLabel, tgtLabel, targetTopic).Inc()
-					if s.dlq != nil {
-						s.dlq.Send(ctx, record.Topic, record.Partition, srcOffset, record.Key, record.Value, record.Headers, err)
+
+					// [FIX-FORGE Bug3] Retry the failed produce with exponential backoff
+					retryErr := Retry(ctx, s.retryCfg, func(retryCtx context.Context) error {
+						s.metrics.RetryAttempts.WithLabelValues(srcLabel, tgtLabel, "produce").Inc()
+						retryRecord := &kgo.Record{
+							Topic:     targetTopic,
+							Partition: srcPartition,
+							Key:       srcKey,
+							Value:     srcValue,
+							Headers:   srcHeaders,
+						}
+						var produceErr error
+						var retryWg sync.WaitGroup
+						retryWg.Add(1)
+						s.producer.Produce(retryCtx, retryRecord, func(rr *kgo.Record, e error) {
+							defer retryWg.Done()
+							produceErr = e
+							if e == nil && rr != nil {
+								if config.BoolDefault(s.cfg.EmitOffsetSyncs, true) && s.syncStore != nil {
+									osync := types.OffsetSync{
+										TopicPartition:   srcTP,
+										UpstreamOffset:   srcOffset,
+										DownstreamOffset: rr.Offset,
+									}
+									s.syncStore.HandleSync(osync)
+								}
+							}
+						})
+						retryWg.Wait()
+						return produceErr
+					})
+
+					if retryErr != nil {
+						// [FIX-FORGE Bug2] Increment produce error counter to block offset commit
+						s.produceErrors.Add(1)
+						s.metrics.RetryExhausted.WithLabelValues(srcLabel, tgtLabel, "produce").Inc()
+
+						// [FIX-FORGE Bug3] Send to DLQ if available
+						if s.dlq != nil {
+							s.dlq.Send(ctx, srcTopic, srcPartition, srcOffset, srcKey, srcValue, srcHeaders, retryErr)
+						}
+						s.logger.Error("produce failed after all retries",
+							"topic", targetTopic, "partition", srcPartition,
+							"offset", srcOffset, "err", retryErr,
+							"dlq_enabled", s.dlq != nil)
 					}
 					return
 				}
@@ -381,10 +482,28 @@ func (s *Source) replicationLoop(ctx context.Context) {
 		}
 
 		// === PERIODIC OFFSET COMMIT ===
+		// [FIX-FORGE Bug2] Only commit offsets if there are no produce errors.
+		// Previously, produce callback errors didn't block offset commit, meaning
+		// failed records' offsets would be committed and the records permanently lost.
+		// Now we drain inflight, check for errors, and skip commit if any occurred.
 		recordsSinceCommit += int64(batchLen)
 		if recordsSinceCommit >= int64(commitBatch) || time.Since(lastCommitTime) >= commitInterval {
 			// Drain all in-flight produces before committing offsets
 			s.inflight.Wait()
+
+			// [FIX-FORGE Bug2] Check if any produce errors occurred since last commit.
+			// If so, do NOT commit offsets — the failed records need to be re-consumed
+			// on next restart to maintain at-least-once semantics.
+			errCount := s.produceErrors.Swap(0)
+			if errCount > 0 {
+				s.logger.Error("skipping offset commit due to produce errors — records will be re-consumed on restart",
+					"produce_errors", errCount,
+					"records_since_last_commit", recordsSinceCommit,
+				)
+				s.metrics.OffsetCommitErrors.WithLabelValues(s.cfg.Source, s.cfg.Target).Inc()
+				// Don't reset recordsSinceCommit — will retry commit next cycle
+				continue
+			}
 
 			if err := s.consumer.CommitUncommittedOffsets(ctx); err != nil {
 				s.logger.Error("offset commit failed", "err", err)

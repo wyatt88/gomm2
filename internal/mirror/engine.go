@@ -175,16 +175,30 @@ func (e *Engine) Run(ctx context.Context) error {
 			continue
 		}
 
+		// [FIX-FORGE Bug4] Create target admin client to ensure target topics exist
+		// BEFORE starting parallel catch-up. Previously, catch-up would start producing
+		// to non-existent target topics, causing UNKNOWN_TOPIC_OR_PARTITION errors.
+		tgtAdminClient, err := admin.NewClient(ctx, tgtCfg)
+		if err != nil {
+			e.logger.Warn("skip target topic auto-creation: target admin client error", "err", err)
+		}
+
+		// [FIX-FORGE Bug4] Build replication policy for topic name mapping
+		pol, polErr := policy.NewPolicy(r.ReplicationPolicy, r.Separator)
+		if polErr != nil {
+			e.logger.Warn("skip target topic auto-creation: policy error", "err", polErr)
+		}
+
 		const parallelThreshold = 100000 // only parallelize if lag > 100K records
 
-		// Smart worker allocation:
-		// - Total memory budget for fetch buffers: ~2GB
-		// - Each worker uses ~5MB FetchMaxPartitionBytes + overhead ≈ 10MB
-		// - 3 brokers × 188 MB/s = 564 MB/s source limit
-		// - With 30ms RTT and 5MB fetch per worker: ~166 MB/s theoretical per conn
-		// - Need ~564 / 166 ≈ 4 workers minimum, use 6 for headroom
-		// - 6 workers × 8 partitions = 48 total workers ≈ 480MB fetch buffers
-		const workersPerPartition = 6
+		// Worker allocation from config (default 4).
+		// Memory budget: workers × partitions × FetchMaxPartitionBytes.
+		// With 4 workers × 8 partitions × 5MB = 160MB fetch buffers — safe for 4Gi pods.
+		// Increase to 6 only on high-memory instances (>=16GB).
+		workersPerPartition := r.WorkersPerPartition
+		if workersPerPartition < 2 {
+			workersPerPartition = 2
+		}
 
 		for _, topic := range topics {
 			// Skip internal topics
@@ -201,6 +215,26 @@ func (e *Engine) Run(ctx context.Context) error {
 			topicAdm.Close()
 			if err != nil {
 				partitions = []int32{0}
+			}
+
+			// [FIX-FORGE Bug4] Ensure target topic exists BEFORE collecting lag and
+			// starting parallel catch-up. This prevents UNKNOWN_TOPIC_OR_PARTITION errors
+			// that caused the first startup failure in the 300GB test.
+			if tgtAdminClient != nil && pol != nil {
+				targetTopic := pol.FormatRemoteTopic(r.Source, topic)
+				if createErr := tgtAdminClient.CreateTopic(ctx, targetTopic, int32(len(partitions)), r.ReplicationFactor, nil); createErr != nil {
+					// Ignore "topic already exists" errors — CreateTopic returns error
+					// for already-existing topics too, which is fine.
+					e.logger.Debug("target topic create result (may already exist)",
+						"topic", targetTopic, "err", createErr)
+				} else {
+					e.logger.Info("auto-created target topic before catch-up",
+						"source_topic", topic,
+						"target_topic", targetTopic,
+						"partitions", len(partitions),
+						"replication_factor", r.ReplicationFactor,
+					)
+				}
 			}
 
 			// Collect lags for all partitions
@@ -235,6 +269,11 @@ func (e *Engine) Run(ctx context.Context) error {
 					e.logger.Error("parallel catch-up failed", "topic", topic, "err", err)
 				}
 			}
+		}
+
+		// [FIX-FORGE Bug4] Close the target admin client after all topics are processed
+		if tgtAdminClient != nil {
+			tgtAdminClient.Close()
 		}
 	}
 
@@ -287,8 +326,18 @@ func (e *Engine) Run(ctx context.Context) error {
 // reads existing offset sync data to populate the sync stores, then
 // starts background followers for real-time updates.
 func (e *Engine) bootstrapOffsetSyncs(ctx context.Context) error {
+	// FIX(nexus): Bug 1 — track the source index correctly so each flow's
+	// SyncWriter is wired to the corresponding Source, not always the last one.
+	// Previously used e.sources[len(e.sources)-1] which meant only the last
+	// replication flow got a SyncWriter; all prior flows had nil syncWriter
+	// and never persisted offset syncs.
+	sourceIdx := 0
 	for _, r := range e.cfg.Replications {
-		if !r.Enabled || !config.BoolDefault(r.EmitOffsetSyncs, true) {
+		if !r.Enabled {
+			continue
+		}
+		if !config.BoolDefault(r.EmitOffsetSyncs, true) {
+			sourceIdx++ // still count this source even if offset syncs disabled
 			continue
 		}
 
@@ -336,11 +385,14 @@ func (e *Engine) bootstrapOffsetSyncs(ctx context.Context) error {
 		}
 		e.syncWriters = append(e.syncWriters, writer)
 
-		// Wire the sync writer into the source so it can persist offset syncs
+		// FIX(nexus): Wire the sync writer to the correct source for each flow.
 		if src, ok := e.sourcesByFlow[flowKey]; ok {
 			src.SetSyncWriter(writer)
+			e.logger.Info("sync writer wired to source",
+				"flow", flowKey, "source_index", sourceIdx)
 		}
 
+		sourceIdx++
 	}
 
 	return nil

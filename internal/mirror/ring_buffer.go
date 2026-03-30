@@ -178,6 +178,15 @@ func (rb *OrderedRingBuffer) Close() {
 	rb.cond.Broadcast()
 }
 
+// CloseWithError signals all waiters to stop due to a fatal error.
+// This is semantically identical to Close but allows callers to distinguish
+// between normal completion and error-driven shutdown.
+// [FIX-FORGE Bug1] Added to allow fetcher failures to unblock drainer.
+func (rb *OrderedRingBuffer) CloseWithError() {
+	rb.closed.Store(true)
+	rb.cond.Broadcast()
+}
+
 // DrainOffset returns the current drain position.
 func (rb *OrderedRingBuffer) DrainOffset() int64 {
 	return rb.drainOffset.Load()
