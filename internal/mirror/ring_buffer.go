@@ -83,13 +83,15 @@ func (rb *OrderedRingBuffer) Put(ctx context.Context, offset int64, record *kgo.
 	idx := rb.slotIndex(offset)
 	slot := &rb.slots[idx]
 
-	// Fast path: slot is already empty — skip lock entirely
+	// Fast path: slot is already empty — use CAS to avoid data race
 	if slot.state.Load() == slotEmpty {
 		slot.record = record
 		slot.offset = offset
-		slot.state.Store(slotFilled)
-		rb.cond.Signal()
-		return true
+		if slot.state.CompareAndSwap(slotEmpty, slotFilled) {
+			rb.cond.Signal()
+			return true
+		}
+		// CAS failed, fall through to slow path
 	}
 
 	// Slow path: slot is occupied — wait for drainer to free it.

@@ -7,6 +7,8 @@ metadata:
     app: gomm2
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: gomm2
@@ -19,6 +21,11 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
       containers:
         - name: gomm2
           image: gomm2:latest
@@ -29,25 +36,34 @@ spec:
             - name: metrics
               containerPort: 9090
               protocol: TCP
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           livenessProbe:
             httpGet:
               path: /healthz
               port: metrics
-            initialDelaySeconds: 10
+            initialDelaySeconds: 15
             periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /readyz
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
           resources:
             requests:
-              cpu: 500m
-              memory: 256Mi
+              cpu: "1"
+              memory: 512Mi
             limits:
-              cpu: "2"
-              memory: 1Gi
+              cpu: "4"
+              memory: 2Gi
           volumeMounts:
             - name: config
               mountPath: /etc/gomm2
