@@ -212,6 +212,9 @@ func (c *Config) Validate() error {
 		if r.Source == r.Target {
 			return fmt.Errorf("replication[%d]: source and target must differ", i)
 		}
+		if r.ExactlyOnce {
+			return fmt.Errorf("replication[%d]: exactly_once is not yet implemented; remove this option or set to false", i)
+		}
 		// Validate regex patterns
 		for _, p := range r.TopicFilter.Whitelist {
 			if _, err := regexp.Compile(p); err != nil {

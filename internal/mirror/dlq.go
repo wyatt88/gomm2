@@ -17,6 +17,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/gomm2/gomm2/internal/config"
+	"github.com/gomm2/gomm2/internal/kafka"
 	"github.com/gomm2/gomm2/internal/metrics"
 )
 
@@ -45,18 +46,14 @@ func NewDLQ(
 
 	topic := fmt.Sprintf("gomm2-dlq-%s-%s", cfg.Source, cfg.Target)
 
-	opts := []kgo.Opt{
-		kgo.SeedBrokers(tgtCfg.BootstrapServers...),
+	opts, err := kafka.BuildClientOpts(tgtCfg)
+	if err != nil {
+		return nil, fmt.Errorf("DLQ build client opts: %w", err)
+	}
+	opts = append(opts,
 		kgo.RequiredAcks(kgo.AllISRAcks()),
-		kgo.ProducerLinger(100 * time.Millisecond),
-	}
-	if tgtCfg.TLS != nil && tgtCfg.TLS.Enabled {
-		tlsCfg, err := tgtCfg.TLS.BuildTLSConfig()
-		if err != nil {
-			return nil, fmt.Errorf("DLQ target TLS: %w", err)
-		}
-		opts = append(opts, kgo.DialTLSConfig(tlsCfg))
-	}
+		kgo.ProducerLinger(100*time.Millisecond),
+	)
 
 	producer, err := kgo.NewClient(opts...)
 	if err != nil {

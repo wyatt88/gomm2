@@ -31,6 +31,7 @@ type Source struct {
 	metrics     *metrics.Metrics
 	syncStore   *offset.SyncStore
 	syncWriter  *offset.SyncWriter
+	dlq         *DLQ
 	logger      *slog.Logger
 
 	consumer *kgo.Client
@@ -42,11 +43,6 @@ type Source struct {
 	wg               sync.WaitGroup
 	subscribedTopics map[string]struct{}
 	inflight         sync.WaitGroup
-
-	// parallelism: number of concurrent consumer→producer pipelines
-	// Each pipeline has its own TCP connections, multiplying effective throughput
-	parallelism int
-	consumers   []*kgo.Client
 }
 
 // NewSource creates a new Source replicator.
@@ -146,8 +142,8 @@ func (s *Source) Start(ctx context.Context) error {
 
 		kgo.ProducerBatchCompression(compressionCodec(s.cfg.Compression)),
 
-		// No idempotency: allows >1 inflight per broker without transactions
-		kgo.DisableIdempotentWrite(),
+		// Idempotent writes enabled (default) for ordering guarantees.
+		// Idempotent mode supports high inflight without risking reordering.
 
 		// High inflight: multiple produce batches can be in-flight simultaneously
 		// This is THE most important producer knob for cross-region latency.
@@ -261,6 +257,22 @@ func (s *Source) replicationLoop(ctx context.Context) {
 	srcLabel := s.cfg.Source
 	tgtLabel := s.cfg.Target
 
+	// Final metrics flush on exit — ensure no counters are lost
+	defer func() {
+		for key, count := range localRecCounts {
+			var topic, part string
+			for i := len(key) - 1; i >= 0; i-- {
+				if key[i] == ':' {
+					topic = key[:i]
+					part = key[i+1:]
+					break
+				}
+			}
+			s.metrics.RecordsReplicated.WithLabelValues(srcLabel, tgtLabel, topic, part).Add(count)
+			s.metrics.BytesReplicated.WithLabelValues(srcLabel, tgtLabel, topic, part).Add(localByteCounts[key])
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -324,8 +336,12 @@ func (s *Source) replicationLoop(ctx context.Context) {
 
 					if s.syncWriter != nil {
 						if recordsSinceSync.Add(1)%syncWriteInterval == 0 {
+							s.inflight.Add(1)
 							go func(o types.OffsetSync) {
-								if wErr := s.syncWriter.Write(ctx, o); wErr != nil {
+								defer s.inflight.Done()
+								writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+								defer cancel()
+								if wErr := s.syncWriter.Write(writeCtx, o); wErr != nil {
 									s.logger.Warn("failed to persist offset sync", "err", wErr)
 								}
 							}(osync)

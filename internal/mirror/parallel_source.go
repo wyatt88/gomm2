@@ -100,7 +100,6 @@ func (ps *ParallelSource) CatchUpMultiPartition(ctx context.Context, partitionLa
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.ProducerBatchCompression(kgo.Lz4Compression()),
-		kgo.DisableIdempotentWrite(),
 		kgo.MaxProduceRequestsInflightPerBroker(20),
 		kgo.MaxBufferedRecords(500000),            // 500K buffered records
 	)

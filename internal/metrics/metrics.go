@@ -37,18 +37,18 @@ func New() *Metrics {
 			Namespace: "gomm2",
 			Name:      "records_replicated_total",
 			Help:      "Total number of records replicated.",
-		}, []string{"source", "target", "topic", "partition"}),
+		}, []string{"source", "target", "topic"}),
 
 		BytesReplicated: promauto.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "gomm2",
 			Name:      "bytes_replicated_total",
 			Help:      "Total bytes replicated.",
-		}, []string{"source", "target", "topic", "partition"}),
+		}, []string{"source", "target", "topic"}),
 
 		ReplicationLag: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "gomm2",
-			Name:      "replication_lag",
-			Help:      "Current replication lag per partition (number of records).",
+			Name:      "replication_lag_records",
+			Help:      "Current replication lag per partition (number of records behind).",
 		}, []string{"source", "target", "topic", "partition"}),
 
 		RecordAge: promauto.NewHistogramVec(prometheus.HistogramOpts{

@@ -28,13 +28,15 @@ type Engine struct {
 	metrics *metrics.Metrics
 	logger  *slog.Logger
 
-	sources         []*Source
-	heartbeats      []*Heartbeat
-	checkpoints     []*Checkpoint
+	sources          []*Source
+	sourcesByFlow    map[string]*Source              // keyed by "source->target"
+	heartbeats       []*Heartbeat
+	checkpoints      []*Checkpoint
 	topicDiscoveries []*TopicDiscovery
-	syncStores      map[string]*offset.SyncStore   // keyed by "source->target"
-	syncReaders     []*offset.SyncReader
-	syncWriters     []*offset.SyncWriter
+	syncStores       map[string]*offset.SyncStore   // keyed by "source->target"
+	syncReaders      []*offset.SyncReader
+	syncWriters      []*offset.SyncWriter
+	dlqs             []*DLQ
 
 	httpServer *http.Server
 
@@ -58,10 +60,11 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 	m := metrics.New()
 
 	e := &Engine{
-		cfg:        cfg,
-		metrics:    m,
-		logger:     logger,
-		syncStores: make(map[string]*offset.SyncStore),
+		cfg:           cfg,
+		metrics:       m,
+		logger:        logger,
+		syncStores:    make(map[string]*offset.SyncStore),
+		sourcesByFlow: make(map[string]*Source),
 	}
 
 	// Initialize components for each enabled replication
@@ -88,6 +91,17 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 			return nil, fmt.Errorf("create source for %s: %w", flowKey, err)
 		}
 		e.sources = append(e.sources, src)
+		e.sourcesByFlow[flowKey] = src
+
+		// DLQ
+		dlq, err := NewDLQ(r, tgtCfg, m, logger)
+		if err != nil {
+			return nil, fmt.Errorf("create DLQ for %s: %w", flowKey, err)
+		}
+		if dlq != nil {
+			src.SetDLQ(dlq)
+			e.dlqs = append(e.dlqs, dlq)
+		}
 
 		// Heartbeat emitter
 		hb, err := NewHeartbeat(r, tgtCfg, m, logger)
@@ -323,7 +337,9 @@ func (e *Engine) bootstrapOffsetSyncs(ctx context.Context) error {
 		e.syncWriters = append(e.syncWriters, writer)
 
 		// Wire the sync writer into the source so it can persist offset syncs
-		e.sources[len(e.sources)-1].SetSyncWriter(writer)
+		if src, ok := e.sourcesByFlow[flowKey]; ok {
+			src.SetSyncWriter(writer)
+		}
 
 	}
 
@@ -354,6 +370,11 @@ func (e *Engine) Shutdown() {
 	}
 	for _, sw := range e.syncWriters {
 		sw.Close()
+	}
+
+	// Close DLQ producers
+	for _, d := range e.dlqs {
+		d.Close()
 	}
 
 	if e.httpServer != nil {
