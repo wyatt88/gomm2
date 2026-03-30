@@ -79,6 +79,11 @@ func (s *Source) SetSyncWriter(w *offset.SyncWriter) {
 	s.syncWriter = w
 }
 
+// SetDLQ sets the dead letter queue for failed records.
+func (s *Source) SetDLQ(d *DLQ) {
+	s.dlq = d
+}
+
 // Start begins replication.
 func (s *Source) Start(ctx context.Context) error {
 	s.mu.Lock()
@@ -321,8 +326,11 @@ func (s *Source) replicationLoop(ctx context.Context) {
 			s.producer.Produce(ctx, targetRecord, func(r *kgo.Record, err error) {
 				defer s.inflight.Done()
 				if err != nil {
-					s.logger.Error("produce error", "topic", targetTopic, "err", err)
+					s.logger.Error("produce error", "topic", targetTopic, "partition", record.Partition, "offset", srcOffset, "err", err)
 					s.metrics.ProduceErrors.WithLabelValues(srcLabel, tgtLabel, targetTopic).Inc()
+					if s.dlq != nil {
+						s.dlq.Send(ctx, record.Topic, record.Partition, srcOffset, record.Key, record.Value, record.Headers, err)
+					}
 					return
 				}
 

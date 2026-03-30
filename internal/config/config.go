@@ -183,8 +183,9 @@ func Load(path string) (*Config, error) {
 
 // Parse parses YAML configuration bytes.
 func Parse(data []byte) (*Config, error) {
+	expanded := os.ExpandEnv(string(data))
 	cfg := &Config{}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	if err := yaml.Unmarshal([]byte(expanded), cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	setDefaults(cfg)
@@ -195,6 +196,11 @@ func Parse(data []byte) (*Config, error) {
 func (c *Config) Validate() error {
 	if len(c.Clusters) == 0 {
 		return fmt.Errorf("no clusters defined")
+	}
+	for name, cc := range c.Clusters {
+		if len(cc.BootstrapServers) == 0 {
+			return fmt.Errorf("cluster %q: bootstrap_servers is empty", name)
+		}
 	}
 	if len(c.Replications) == 0 {
 		return fmt.Errorf("no replications defined")
@@ -225,6 +231,10 @@ func (c *Config) Validate() error {
 			if _, err := regexp.Compile(p); err != nil {
 				return fmt.Errorf("replication[%d]: invalid topic blacklist regex %q: %w", i, p, err)
 			}
+		}
+		validCompressions := map[string]bool{"none": true, "gzip": true, "snappy": true, "lz4": true, "zstd": true, "": true}
+		if !validCompressions[r.Compression] {
+			return fmt.Errorf("replication[%d]: unsupported compression %q", i, r.Compression)
 		}
 	}
 	return nil

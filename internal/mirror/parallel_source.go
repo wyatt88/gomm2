@@ -406,6 +406,8 @@ func (ps *ParallelSource) CatchUp(ctx context.Context, topic string, partition i
 }
 
 // GetPartitionLag returns committed offset and HWM for a topic:partition.
+//
+// Deprecated: Use GetAllPartitionLags for batch queries that reuse a single admin client.
 func GetPartitionLag(ctx context.Context, srcCfg config.ClusterConfig, group, topic string, partition int32) (int64, int64, error) {
 	opts, err := kafka.BuildClientOpts(srcCfg)
 	if err != nil {
@@ -444,4 +446,44 @@ func GetPartitionLag(ctx context.Context, srcCfg config.ClusterConfig, group, to
 	})
 
 	return committedOffset, hwm, nil
+}
+
+// GetAllPartitionLags returns lag for all partitions of given topics using a single admin client.
+func GetAllPartitionLags(ctx context.Context, srcCfg config.ClusterConfig, group string, topics []string) (map[string]map[int32][2]int64, error) {
+	opts, err := kafka.BuildClientOpts(srcCfg)
+	if err != nil {
+		return nil, err
+	}
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	adm := kadm.NewClient(client)
+
+	offsets, err := adm.FetchOffsets(ctx, group)
+	if err != nil {
+		return nil, fmt.Errorf("fetch offsets: %w", err)
+	}
+
+	endOffsets, err := adm.ListEndOffsets(ctx, topics...)
+	if err != nil {
+		return nil, fmt.Errorf("list end offsets: %w", err)
+	}
+
+	result := make(map[string]map[int32][2]int64)
+	endOffsets.Each(func(o kadm.ListedOffset) {
+		hwm := o.Offset
+		var committed int64
+		offsets.Each(func(co kadm.OffsetResponse) {
+			if co.Topic == o.Topic && co.Partition == o.Partition {
+				committed = co.At
+			}
+		})
+		if _, ok := result[o.Topic]; !ok {
+			result[o.Topic] = make(map[int32][2]int64)
+		}
+		result[o.Topic][o.Partition] = [2]int64{committed, hwm}
+	})
+	return result, nil
 }
