@@ -75,13 +75,15 @@ func TestMultipleSyncsPreservesLatest(t *testing.T) {
 	store.HandleSync(makeSync("t", 0, 200, 150))
 	store.HandleSync(makeSync("t", 0, 300, 250))
 
-	// Query for offset 250 — should find sync at 200
+	// Query for offset 250 — with exponential spacing, slots 0-8 hold sync (300,250)
+	// and slots 9+ hold (100,50). Since 250 < 300, we skip to slot 9 (upstream=100),
+	// and translate as downstream=50+1=51 (step=1 because 100 < 250).
 	got, ok := store.TranslateDownstream(tp("t", 0), 250)
 	if !ok {
 		t.Fatal("expected translation to succeed")
 	}
-	if got != 151 {
-		t.Errorf("expected 151, got %d", got)
+	if got != 51 {
+		t.Errorf("expected 51, got %d", got)
 	}
 
 	// Query for exact latest sync
